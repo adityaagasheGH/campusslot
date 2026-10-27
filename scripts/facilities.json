@@ -1,0 +1,93 @@
+[
+  {
+    "id": "computer-lab-1",
+    "name": "Computer Lab 1",
+    "type": "lab",
+    "location": "Block A, 2nd floor",
+    "description": "40 desktops with Python, MATLAB and Office. Projector and whiteboard.",
+    "capacity": 40,
+    "open": "08:00",
+    "close": "20:00",
+    "slotMinutes": 60,
+    "requiresApproval": false,
+    "hidden": false
+  },
+  {
+    "id": "electronics-lab",
+    "name": "Electronics Lab",
+    "type": "lab",
+    "location": "Block B, ground floor",
+    "description": "Oscilloscopes, power supplies and soldering stations for project work.",
+    "capacity": 24,
+    "open": "09:00",
+    "close": "18:00",
+    "slotMinutes": 60,
+    "requiresApproval": false,
+    "hidden": false
+  },
+  {
+    "id": "seminar-hall-a",
+    "name": "Seminar Hall A",
+    "type": "seminar_hall",
+    "location": "Admin Block, 1st floor",
+    "description": "Tiered seating, projector, PA system. Requests need approval by the facility office.",
+    "capacity": 120,
+    "open": "09:00",
+    "close": "18:00",
+    "slotMinutes": 60,
+    "requiresApproval": true,
+    "hidden": false
+  },
+  {
+    "id": "study-room-1",
+    "name": "Study Room 1",
+    "type": "study_room",
+    "location": "Library, 3rd floor",
+    "description": "Quiet group room with a wall screen and whiteboard.",
+    "capacity": 6,
+    "open": "07:00",
+    "close": "22:00",
+    "slotMinutes": 30,
+    "requiresApproval": false,
+    "hidden": false
+  },
+  {
+    "id": "study-room-2",
+    "name": "Study Room 2",
+    "type": "study_room",
+    "location": "Library, 3rd floor",
+    "description": "Group room with a round table for up to 8 people.",
+    "capacity": 8,
+    "open": "07:00",
+    "close": "22:00",
+    "slotMinutes": 30,
+    "requiresApproval": false,
+    "hidden": false
+  },
+  {
+    "id": "badminton-court",
+    "name": "Badminton Court",
+    "type": "sports_court",
+    "location": "Indoor Sports Complex",
+    "description": "Wooden-floor court. Bring your own racquets; shuttles at the desk.",
+    "capacity": 4,
+    "open": "06:00",
+    "close": "21:00",
+    "slotMinutes": 30,
+    "requiresApproval": false,
+    "hidden": false
+  },
+  {
+    "id": "main-auditorium",
+    "name": "Main Auditorium",
+    "type": "auditorium",
+    "location": "Central Building",
+    "description": "500 seats, stage lighting and sound. Requests need approval by the facility office.",
+    "capacity": 500,
+    "open": "09:00",
+    "close": "21:00",
+    "slotMinutes": 60,
+    "requiresApproval": true,
+    "hidden": false
+  }
+]

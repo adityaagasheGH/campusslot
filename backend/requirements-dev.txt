@@ -1,0 +1,5 @@
+# Only for tests and the local server. The Lambda functions use the standard library
+# plus the boto3 that ships with the Python 3.13 runtime: nothing is packaged.
+boto3>=1.35.60
+moto[s3,sns]>=5.1
+pytest>=8

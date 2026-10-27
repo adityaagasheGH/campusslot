@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CampusSlot - serverless campus facility booking. CloudFront + private S3 website,
+  S3 data bucket with conditional writes, two Lambda functions (API behind a function
+  URL, lifecycle sweeper on EventBridge), SNS alerts, CloudWatch logs/metrics/alarms.
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: Bucket holding the Lambda code zip (created by deploy.sh).
+  CodeKey:
+    Type: String
+    Description: Key of the Lambda code zip inside CodeBucket.
+  AuthSigningKey:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Random key used to sign sign-in tokens (generated once by deploy.sh).
+  AlertEmail:
+    Type: String
+    Description: Facility office email for approval requests, sweep summaries and alarms.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  LambdaRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Existing role for both functions (the AWS Academy LabRole). Leave empty on a normal
+      account to create the two least-privilege roles below instead.
+
+Conditions:
+  CreateRoles: !Equals [!Ref LambdaRoleArn, ""]
+
+Resources:
+  # ---------------------------------------------------------------- website
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub campusslot-web-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub campusslot-oac-${AWS::AccountId}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: CampusSlot website
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6          # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /config.json
+            TargetOriginId: web
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CustomErrorResponses:
+          # Single-page app: unknown paths (S3 answers 403 for missing keys) load index.html.
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${WebBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: HttpsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt WebBucket.Arn, !Sub "${WebBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------- data
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub campusslot-data-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-slot-locks       # replaces DynamoDB TTL
+            Status: Enabled
+            Prefix: locks/
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------- alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: campusslot-admin-alerts
+      DisplayName: CampusSlot
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- least-privilege roles (normal accounts only)
+  ApiRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: campusslot-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub ${DataBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ApiLogGroup.Arn
+
+  SweeperRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: campusslot-sweeper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub "${DataBucket.Arn}/bookings/*", !Sub "${DataBucket.Arn}/locks/*"]
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: [bookings/*, locks/*]
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SweeperLogGroup.Arn
+
+  # ---------------------------------------------------------------- functions
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/campusslot-api
+      RetentionInDays: 14
+
+  SweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/campusslot-sweeper
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: campusslot-api
+      Description: CampusSlot API (19 routes behind the function URL)
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 15
+      Role: !If [CreateRoles, !GetAtt ApiRole.Arn, !Ref LambdaRoleArn]
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          TOPIC_ARN: !Ref AlertsTopic
+          AUTH_SIGNING_KEY: !Ref AuthSigningKey
+          SERVICE_NAME: api
+
+  ApiFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref ApiFunction
+      AuthType: NONE            # identity is checked inside the function
+      Cors:
+        AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+        AllowMethods: [GET, POST, PUT]
+        AllowHeaders: [authorization, content-type]
+        ExposeHeaders: [x-request-id]
+        MaxAge: 600
+
+  # A public function URL needs both permissions; with only the first it answers 403.
+  ApiFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ApiFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  SweeperFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SweeperLogGroup
+    Properties:
+      FunctionName: campusslot-sweeper
+      Description: Marks no-shows, expires requests, completes bookings, frees orphan locks
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: sweeper.handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !If [CreateRoles, !GetAtt SweeperRole.Arn, !Ref LambdaRoleArn]
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          TOPIC_ARN: !Ref AlertsTopic
+          SERVICE_NAME: sweeper
+
+  SweepSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: campusslot-lifecycle-sweep
+      Description: Run the CampusSlot sweeper every 15 minutes
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Id: sweeper
+          Arn: !GetAtt SweeperFunction.Arn
+
+  SweepSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SweeperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweepSchedule.Arn
+
+  # ---------------------------------------------------------------- monitoring
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: campusslot-api-errors
+      AlarmDescription: The API function raised an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  ApiUrl5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: campusslot-api-5xx
+      AlarmDescription: The function URL returned 3 or more 5xx responses in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Url5xxCount
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  SweeperErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: campusslot-sweeper-errors
+      AlarmDescription: The lifecycle sweeper failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref SweeperFunction }]
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: campusslot-operations
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Booking activity", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["CampusSlot", "BookingsCreated", "Service", "api"],
+                ["CampusSlot", "BookingConflicts", "Service", "api"],
+                ["CampusSlot", "CheckIns", "Service", "api"],
+                ["CampusSlot", "NoShowsReleased", "Service", "sweeper"]
+              ]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Function URL requests and errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["AWS/Lambda", "UrlRequestCount", "FunctionName", "${ApiFunction}"],
+                ["AWS/Lambda", "Url4xxCount", "FunctionName", "${ApiFunction}"],
+                ["AWS/Lambda", "Url5xxCount", "FunctionName", "${ApiFunction}"],
+                ["AWS/Lambda", "Errors", "FunctionName", "${SweeperFunction}", {"label": "Sweeper errors"}]
+              ]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "API latency (ms)", "region": "${AWS::Region}", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["AWS/Lambda", "Duration", "FunctionName", "${ApiFunction}", {"stat": "p50", "label": "p50"}],
+                ["AWS/Lambda", "Duration", "FunctionName", "${ApiFunction}", {"stat": "p95", "label": "p95"}]
+              ]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Sign-in failures and API errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["CampusSlot", "SignInFailures", "Service", "api"],
+                ["CampusSlot", "ApiErrors", "Service", "api"]
+              ]}}
+          ]
+        }
+
+Outputs:
+  WebsiteUrl:
+    Value: !Sub https://${Distribution.DomainName}
+  ApiUrl:
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  WebBucketName:
+    Value: !Ref WebBucket
+  DataBucketName:
+    Value: !Ref DataBucket
+  DistributionId:
+    Value: !Ref Distribution
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
